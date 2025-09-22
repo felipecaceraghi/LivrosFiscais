@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: livros-fiscais-app
+    container_name: LivrosFiscais
     ports:
       - "0.0.0.0:5000:5000"  # Bind em todas as interfaces de rede
     volumes:
