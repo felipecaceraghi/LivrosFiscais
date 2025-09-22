@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  livros-fiscais:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: livros-fiscais-app
+    ports:
+      - "0.0.0.0:5000:5000"  # Bind em todas as interfaces de rede
+    volumes:
+      # Volume para persistir arquivos gerados
+      - ./output_robo:/app/output_robo
+      # Volume para logs (opcional)
+      - ./logs:/app/logs
+      # Volume para acesso à rede
+      - /home/roboestatistica/rede/Acesso Digital:/home/roboestatistica/rede/Acesso Digital
+      # Volume para timezone (garantir sincronização com host)
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - FLASK_APP=main.py
+      - FLASK_ENV=production
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=5000
+      # Configurações do SQL Anywhere (se necessário)
+      - SQLANY17=/opt/sqlanywhere17
+      - DOCKER=true
+      # Configuração de timezone
+      - TZ=America/Sao_Paulo
+      # Descomente a linha abaixo para usar modo simulação
+      # - SIMULATE_ENV=true
+    # env_file:
+    #   - .env  # Descomente se você tiver um arquivo .env
+    extra_hosts:
+      - "NOTE-GO-273.go.local:192.168.51.8"
+    restart: unless-stopped
+    networks:
+      - livros-fiscais-network
+    # Healthcheck para verificar se a aplicação está funcionando
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Serviço adicional para monitoramento (opcional)
+  # Descomente se quiser adicionar um serviço de monitoramento
+  # monitor:
+  #   image: prom/prometheus:latest
+  #   container_name: livros-fiscais-monitor
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #   networks:
+  #     - livros-fiscais-network
+
+networks:
+  livros-fiscais-network:
+    driver: bridge
+
+volumes:
+  output_data:
+    driver: local

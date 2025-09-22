@@ -374,3 +374,5 @@ def gerarLivroDeIpi(codi_emp, data_inicio, data_fim, gerar_pdf=False, gerar_xlsx
     return generated_files
 
 
+
+

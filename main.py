@@ -13,6 +13,15 @@ from threading import Lock
 import asyncio
 import logging
 
+# Configurar timezone brasileiro se rodando em Docker
+if os.environ.get('DOCKER', 'false').lower() == 'true':
+    os.environ['TZ'] = 'America/Sao_Paulo'
+    try:
+        time.tzset()
+    except AttributeError:
+        # tzset não está disponível no Windows
+        pass
+
 # Configurar logging para evitar mensagens desnecessárias
 logging.getLogger('websockets').setLevel(logging.WARNING)
 
@@ -25,8 +34,11 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
 # --- CONFIGURAÇÕES DO WEBSOCKET ---
-WEBSOCKET_URI = "ws://localhost:8765"
+WEBSOCKET_URI = "ws://192.168.51.8:8765"
 RECONNECT_DELAY = 5
+MAX_RECONNECT_ATTEMPTS = 10  # Mais tentativas
+FALLBACK_TIMEOUT = 300  # 5 minutos sem conexão = libera processamento
+HEALTH_CHECK_INTERVAL = 30  # Verificar saúde da conexão a cada 30s
 
 def quebrar_periodo_em_meses(data_inicio_str, data_fim_str):
     """
@@ -184,10 +196,15 @@ class DatabaseMonitor:
             'erro': None,
             'proximo_horario_backup': 'N/A',
             'connected': False,
-            'last_update_time': None
+            'last_update_time': None,
+            'connection_start_time': None,
+            'last_connection_attempt': None,
+            'consecutive_failures': 0
         }
         self.monitor_thread = None
         self.should_stop = False
+        self.last_successful_connection = None
+        self.force_allow_processing = False  # Flag para forçar liberação
         # Não iniciar automaticamente no __init__ para não bloquear o Flask
     
     def start_monitoring(self):
@@ -206,6 +223,13 @@ class DatabaseMonitor:
         
         print("🔍 Iniciando monitor do banco...")
         self.should_stop = False
+        self.force_allow_processing = False  # Reset flag
+        self.last_successful_connection = time.time()
+        self._update_status({
+            'consecutive_failures': 0,
+            'connection_start_time': time.time(),
+            'last_connection_attempt': time.time()
+        })
         self.monitor_thread = threading.Thread(target=self._run_monitor, daemon=True)
         self.monitor_thread.start()
     
@@ -214,6 +238,22 @@ class DatabaseMonitor:
         self.should_stop = True
         if self.monitor_thread:
             self.monitor_thread.join(timeout=2)
+    
+    def force_reset_connection(self):
+        """Força reset da conexão e reinicia o monitor"""
+        print("🔄 FORÇANDO reset da conexão do monitor...")
+        self.stop_monitoring()
+        time.sleep(1)
+        self.force_allow_processing = False
+        self.last_successful_connection = time.time()
+        self._update_status({
+            'consecutive_failures': 0,
+            'erro': None,
+            'progresso': 'Reiniciando monitor...',
+            'connected': False
+        })
+        self.start_monitoring()
+        print("✅ Monitor resetado e reiniciado")
     
     def _run_monitor(self):
         """Executa o loop de monitoramento assíncrono de forma não-bloqueante"""
@@ -242,76 +282,103 @@ class DatabaseMonitor:
                 pass
     
     async def _monitor_websocket(self):
-        """Loop principal de monitoramento do WebSocket"""
+        """Loop principal de monitoramento do WebSocket com reconexão infinita"""
         connection_attempts = 0
-        max_attempts = 3
+        consecutive_failures = 0
+        last_health_check = time.time()
         
         while not self.should_stop:
             try:
                 connection_attempts += 1
-                print(f"🔌 Tentativa de conexão {connection_attempts}/{max_attempts}...")
+                now = time.time()
+                
+                # Verificar se deve liberar processamento por timeout
+                if (self.last_successful_connection and 
+                    now - self.last_successful_connection > FALLBACK_TIMEOUT):
+                    if not self.force_allow_processing:
+                        print(f"⏰ Timeout de {FALLBACK_TIMEOUT}s sem conexão - LIBERANDO processamento")
+                        self.force_allow_processing = True
+                        self._update_status({
+                            'progresso': f'Monitor desconectado há {int(now - self.last_successful_connection)}s - Processamento LIBERADO por timeout',
+                            'atualizacao_em_andamento': False  # FORÇA LIBERAÇÃO
+                        })
+                
+                print(f"🔌 Tentativa de conexão {connection_attempts} (falhas consecutivas: {consecutive_failures})...")
+                self._update_status({
+                    'last_connection_attempt': now,
+                    'consecutive_failures': consecutive_failures
+                })
                 
                 # Timeout mais curto para não travar
                 async with websockets.connect(
                     WEBSOCKET_URI, 
                     ping_interval=20, 
                     ping_timeout=10,
-                    open_timeout=5,  # Timeout de abertura
+                    open_timeout=8,  # Timeout de abertura um pouco maior
                     close_timeout=5   # Timeout de fechamento
                 ) as websocket:
-                    print("✅ Conectado ao monitor do banco")
-                    connection_attempts = 0  # Reset contador
+                    print("✅ Conectado ao monitor do banco - RECONEXÃO SUCCESSFUL")
+                    consecutive_failures = 0  # Reset falhas
+                    self.last_successful_connection = time.time()
+                    self.force_allow_processing = False  # Reset flag
+                    
                     self._update_status({
                         'connected': True, 
                         'erro': None,
-                        'progresso': 'Monitor conectado - aguardando dados...'
+                        'progresso': 'Monitor conectado - aguardando dados...',
+                        'consecutive_failures': 0,
+                        'last_update_time': datetime.now().isoformat()
                     })
                     
-                    # Loop de recebimento de mensagens
+                    # Loop de recebimento de mensagens com health check
                     async for message in websocket:
                         if self.should_stop:
                             break
+                        
+                        # Health check periódico
+                        current_time = time.time()
+                        if current_time - last_health_check > HEALTH_CHECK_INTERVAL:
+                            last_health_check = current_time
+                            self.last_successful_connection = current_time
+                            print(f"💓 Health check OK - conexão ativa há {int(current_time - self.last_successful_connection)}s")
+                        
                         try:
                             data = json.loads(message)
                             self._process_websocket_message(data)
+                            self.last_successful_connection = current_time  # Atualiza a cada mensagem
                         except json.JSONDecodeError:
                             print(f"⚠️ Mensagem WebSocket inválida: {message}")
                         except Exception as e:
                             print(f"⚠️ Erro ao processar mensagem: {e}")
             
-            except (websockets.exceptions.ConnectionClosedError, ConnectionRefusedError) as e:
-                print(f"❌ Conexão perdida: {e}")
+            except (websockets.exceptions.ConnectionClosedError, ConnectionRefusedError, OSError) as e:
+                consecutive_failures += 1
+                delay = min(RECONNECT_DELAY * (1 + consecutive_failures * 0.5), 30)  # Backoff exponencial limitado
+                print(f"❌ Conexão perdida: {e} (falha #{consecutive_failures})")
                 self._update_status({
                     'connected': False,
-                    'progresso': f'Tentando reconectar... ({connection_attempts}/{max_attempts})'
+                    'consecutive_failures': consecutive_failures,
+                    'progresso': f'Reconectando em {delay:.1f}s... (tentativa {connection_attempts}, {consecutive_failures} falhas consecutivas)'
                 })
                 
-                if connection_attempts >= max_attempts:
-                    print(f"❌ Máximo de tentativas atingido. Monitor será desativado.")
-                    self._update_status({
-                        'connected': False,
-                        'erro': 'Monitor indisponível - máximo de tentativas atingido',
-                        'progresso': 'Monitor desconectado'
-                    })
-                    break
-                
                 if not self.should_stop:
-                    await asyncio.sleep(RECONNECT_DELAY)
+                    await asyncio.sleep(delay)
                     
             except Exception as e:
+                consecutive_failures += 1
+                delay = min(RECONNECT_DELAY * 2, 20)  # Delay maior para erros inesperados
                 print(f"❌ Erro inesperado no monitor: {e}")
                 self._update_status({
                     'connected': False, 
-                    'erro': str(e),
-                    'progresso': 'Erro no monitor'
+                    'consecutive_failures': consecutive_failures,
+                    'erro': f'Erro: {str(e)} (tentando reconectar)',
+                    'progresso': f'Erro inesperado - reconectando em {delay}s...'
                 })
                 
-                if connection_attempts >= max_attempts:
-                    print("❌ Monitor será desativado devido a erros persistentes")
-                    break
-                
                 if not self.should_stop:
-                    await asyncio.sleep(RECONNECT_DELAY)
+                    await asyncio.sleep(delay)
+        
+        print("🔴 Monitor WebSocket finalizado")
     
     def _process_websocket_message(self, data):
         """Processa mensagens do WebSocket"""
@@ -382,7 +449,24 @@ class DatabaseMonitor:
     def is_safe_to_process(self):
         """Verifica se é seguro processar (banco não está atualizando)"""
         status = self.get_status()
-        return not status.get('atualizacao_em_andamento', True) and status.get('connected', False)
+        
+        # Se forçado por timeout, sempre permite
+        if self.force_allow_processing:
+            return True
+            
+        # Se conectado e não está atualizando, permite
+        if status.get('connected', False) and not status.get('atualizacao_em_andamento', False):
+            return True
+        
+        # Se desconectado há muito tempo, permite por fallback
+        if self.last_successful_connection:
+            time_since_connection = time.time() - self.last_successful_connection
+            if time_since_connection > FALLBACK_TIMEOUT:
+                print(f"⏰ FALLBACK: Sem conexão há {time_since_connection:.0f}s - LIBERANDO processamento")
+                return True
+        
+        # Caso contrário, bloqueia
+        return False
 
 # Instância global do monitor (não inicializado ainda)
 db_monitor = None
@@ -416,8 +500,17 @@ def setup_dummy_environment():
     print(f"Estrutura de pastas simulada criada em: '{base_dir.resolve()}'")
     return str(base_dir.parent.resolve())
 
-if os.getenv('SIMULATE_ENV'):
-    BASE_ACCESS_PATH = setup_dummy_environment()
+# Verificar se está rodando em Docker ou modo simulação
+is_docker = os.environ.get('DOCKER', 'false').lower() == 'true'
+simulate_env = os.getenv('SIMULATE_ENV')
+
+if simulate_env or is_docker:
+    if is_docker:
+        print("INFO: Executando em MODO DOCKER. Usando volume montado.")
+        # No Docker, usar o volume montado
+        BASE_ACCESS_PATH = "/home/roboestatistica/rede"
+    else:
+        BASE_ACCESS_PATH = setup_dummy_environment()
 else:
     print("INFO: Executando em MODO DE PRODUÇÃO. O caminho de destino será 'R:\\'")
     BASE_ACCESS_PATH = "R:\\"
@@ -840,7 +933,11 @@ def index():
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="locale" content="pt-BR">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Sistema de Automação - Livros Fiscais</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -857,13 +954,52 @@ def index():
             --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Roboto', sans-serif; background-color: var(--gray-50); color: var(--gray-900); line-height: 1.0; min-height: 100vh; }
-        .header { background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); color: var(--white); padding: 0.5rem 1rem; box-shadow: var(--shadow-lg); display: flex; align-items: center; gap: 1rem; transition: all 0.3s ease; }
+        body { 
+            font-family: 'Roboto', sans-serif; 
+            background-color: var(--gray-50); 
+            color: var(--gray-900); 
+            line-height: 1.0; 
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        
+        /* Touch-friendly design */
+        button, .btn-primary, .format-item, .livros-item, input, select {
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+        }
+        
+        .header { 
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
+            color: var(--white); 
+            padding: 0.75rem 1rem; 
+            box-shadow: var(--shadow-lg); 
+            display: flex; 
+            align-items: center; 
+            gap: 1rem; 
+            transition: all 0.3s ease;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
         .header:hover { box-shadow: var(--shadow-xl); }
         .header-logo { height: 40px; object-fit: contain; transition: transform 0.3s ease; }
         .header-logo:hover { transform: scale(1.05); }
-        .header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
-        .container { max-width: 1000px; margin: 1.5rem auto; padding: 0 1rem; }
+        .header h1 { 
+            font-size: 1.5rem; 
+            font-weight: 700; 
+            letter-spacing: -0.025em;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .container { 
+            max-width: 1000px; 
+            margin: 1.5rem auto; 
+            padding: 0 1rem;
+        }
         
         /* STATUS DO BANCO */
         .database-status {
@@ -938,12 +1074,49 @@ def index():
             font-weight: 500;
         }
         
-        .card { background: var(--white); border-radius: 12px; padding: 1.5rem; box-shadow: var(--shadow); border: 1px solid var(--gray-200); transition: all 0.3s ease; }
+        .card { 
+            background: var(--white); 
+            border-radius: 12px; 
+            padding: 1.5rem; 
+            box-shadow: var(--shadow); 
+            border: 1px solid var(--gray-200); 
+            transition: all 0.3s ease;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
+        }
         .card:hover { box-shadow: var(--shadow-lg); transform: translateY(-2px); }
-        .card-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; padding-bottom: 0.75rem; border-bottom: 1px solid var(--gray-200); }
-        .card-header .icon { width: 40px; height: 40px; background: var(--primary); color: var(--white); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 1.125rem; flex-shrink: 0; transition: all 0.3s ease; }
+        .card-header { 
+            display: flex; 
+            align-items: center; 
+            gap: 0.75rem; 
+            margin-bottom: 1rem; 
+            padding-bottom: 0.75rem; 
+            border-bottom: 1px solid var(--gray-200);
+            flex-wrap: wrap;
+        }
+        .card-header .icon { 
+            width: 40px; 
+            height: 40px; 
+            background: var(--primary); 
+            color: var(--white); 
+            border-radius: 8px; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            font-size: 1.125rem; 
+            flex-shrink: 0; 
+            transition: all 0.3s ease;
+        }
         .card-header .icon:hover { background: var(--primary-dark); transform: scale(1.1) rotate(5deg); }
-        .card-header h2 { font-size: 1.25rem; font-weight: 600; color: var(--gray-900); }
+        .card-header h2 { 
+            font-size: 1.25rem; 
+            font-weight: 600; 
+            color: var(--gray-900);
+            flex: 1;
+            min-width: 0;
+            word-wrap: break-word;
+        }
         .companies-count { background: var(--primary-light); color: var(--white); padding: 0.2rem 0.5rem; border-radius: 12px; font-size: 0.7rem; font-weight: 600; margin-left: auto; transition: all 0.3s ease; }
         .companies-count:hover { background: var(--primary-dark); transform: scale(1.05); }
         .form-section { margin-bottom: 1.5rem; }
@@ -1067,6 +1240,54 @@ def index():
         }
         
         /* Custom Date Input Styling - Simplified for custom calendar */
+        /* Configuração específica para formato brasileiro de data */
+        input[type="date"]:lang(pt-BR) {
+            font-family: 'Roboto', sans-serif;
+        }
+        
+        /* Forçar formato brasileiro nos campos de data */
+        input[type="date"]::-webkit-datetime-edit {
+            color: var(--gray-700);
+            font-weight: 500;
+        }
+        
+        input[type="date"]::-webkit-datetime-edit-fields-wrapper {
+            padding: 0;
+        }
+        
+        input[type="date"]::-webkit-datetime-edit-text {
+            color: var(--gray-600);
+            font-weight: 400;
+        }
+        
+        /* Estilização específica para campos dia/mês/ano */
+        input[type="date"]::-webkit-datetime-edit-month-field,
+        input[type="date"]::-webkit-datetime-edit-day-field,
+        input[type="date"]::-webkit-datetime-edit-year-field {
+            padding: 0 2px;
+            border-radius: 3px;
+            background: transparent;
+            color: var(--gray-700);
+            font-weight: 500;
+        }
+        
+        /* Hover effect nos campos individuais */
+        input[type="date"]::-webkit-datetime-edit-month-field:hover,
+        input[type="date"]::-webkit-datetime-edit-day-field:hover,
+        input[type="date"]::-webkit-datetime-edit-year-field:hover {
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--primary);
+        }
+        
+        /* Focus effect nos campos individuais */
+        input[type="date"]::-webkit-datetime-edit-month-field:focus,
+        input[type="date"]::-webkit-datetime-edit-day-field:focus,
+        input[type="date"]::-webkit-datetime-edit-year-field:focus {
+            background: rgba(59, 130, 246, 0.2);
+            color: var(--primary);
+            outline: none;
+        }
+        
         input[type="date"] { 
             width: 100%; 
             padding: 0.65rem 3rem 0.65rem 1rem; 
@@ -1116,6 +1337,22 @@ def index():
         }
         
         /* CALENDÁRIO PERSONALIZADO */
+        .calendar-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 9998;
+            display: none;
+            pointer-events: auto;
+        }
+        
+        .calendar-overlay.show {
+            display: block;
+        }
+        
         .custom-calendar {
             position: absolute;
             top: calc(100% + 0.25rem);
@@ -1124,11 +1361,12 @@ def index():
             border: 1px solid var(--gray-300);
             border-radius: 6px;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-            z-index: 2000;
+            z-index: 9999;
             display: none;
             padding: 0.6rem;
             width: 240px;
             font-size: 0.8rem;
+            pointer-events: auto;
         }
         
         .custom-calendar.show {
@@ -1147,17 +1385,19 @@ def index():
         .calendar-nav-btn {
             background: var(--gray-100);
             border: none;
-            border-radius: 4px;
-            width: 24px;
-            height: 24px;
+            border-radius: 6px;
+            width: 32px;
+            height: 32px;
             display: flex;
             align-items: center;
             justify-content: center;
             cursor: pointer;
             transition: all 0.15s ease;
             color: var(--gray-600);
-            font-size: 0.9rem;
+            font-size: 1rem;
             font-weight: bold;
+            user-select: none;
+            touch-action: manipulation;
         }
         
         .calendar-nav-btn:hover {
@@ -1769,9 +2009,378 @@ def index():
         }
         
         @media (max-width: 768px) { 
-            .basic-info-grid { grid-template-columns: 1fr; } 
-            .livros-grid { grid-template-columns: 1fr 1fr; } 
-            .date-grid { grid-template-columns: 1fr; }
+            .container { 
+                margin: 1rem auto; 
+                padding: 0 0.75rem; 
+            }
+            
+            .header { 
+                padding: 1rem 0.75rem; 
+                flex-direction: column;
+                align-items: center;
+                gap: 0.75rem;
+                text-align: center;
+            }
+            
+            .header h1 { 
+                font-size: 1.1rem; 
+                white-space: normal;
+                line-height: 1.3;
+            }
+            
+            .basic-info-grid { 
+                grid-template-columns: 1fr; 
+                gap: 1.5rem;
+            } 
+            
+            .livros-grid { 
+                grid-template-columns: 1fr 1fr; 
+                gap: 0.75rem;
+            } 
+            
+            .date-grid { 
+                grid-template-columns: 1fr; 
+                gap: 1rem;
+            }
+            
+            .format-grid { 
+                grid-template-columns: 1fr; 
+                gap: 1rem; 
+            }
+            
+            .card {
+                margin: 0.75rem 0;
+                border-radius: 8px;
+            }
+            
+            .card-header {
+                padding: 1rem;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.5rem;
+            }
+            
+            .card-header h2 {
+                font-size: 1.25rem;
+            }
+            
+            .form-section {
+                padding: 1rem;
+            }
+            
+            .section-title {
+                font-size: 1rem;
+                margin-bottom: 1rem;
+            }
+            
+            .main-label {
+                font-size: 0.9rem;
+            }
+            
+            .company-search-input {
+                font-size: 16px; /* Previne zoom no iOS */
+                padding: 0.75rem;
+            }
+            
+            .btn-primary {
+                padding: 1rem 1.5rem;
+                font-size: 1.1rem;
+                margin-top: 1.5rem;
+            }
+            
+            /* Melhorar campos de data em mobile */
+            input[type="date"] {
+                font-size: 16px; /* Previne zoom no iOS */
+                padding: 0.75rem;
+                min-height: 48px; /* Touch target mínimo */
+            }
+            
+            .date-sub-label {
+                font-size: 0.85rem;
+                margin-bottom: 0.5rem;
+            }
+            
+            /* Modal responsivo */
+            .modal-content {
+                width: 95%;
+                margin: 1rem;
+                max-height: 90vh;
+            }
+            
+            .modal-header {
+                padding: 1rem;
+            }
+            
+            .modal-body {
+                padding: 1rem;
+            }
+            
+            .modal-footer {
+                padding: 1rem;
+                flex-direction: column;
+                gap: 0.75rem;
+            }
+            
+            /* Progress bar em mobile */
+            .progress-bar-wrapper {
+                height: 1.5rem;
+            }
+            
+            .progress-text-overlay {
+                font-size: 0.9rem;
+            }
+            
+            /* Status do banco em mobile */
+            .database-status {
+                padding: 0.75rem;
+                margin-bottom: 1rem;
+            }
+            
+            .status-main {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.5rem;
+            }
+            
+            .status-header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.75rem;
+            }
+            
+            /* Calendário personalizado em mobile - simplificado */
+            .custom-calendar {
+                width: 340px !important;
+                max-width: calc(100vw - 2rem) !important;
+                padding: 1.5rem !important;
+                font-size: 1rem !important;
+            }
+            
+            .calendar-day {
+                min-height: 48px !important;
+                font-size: 1.1rem !important;
+                font-weight: 600 !important;
+                border-radius: 8px !important;
+            }
+            
+            .calendar-nav-btn {
+                width: 48px !important;
+                height: 48px !important;
+                font-size: 1.4rem !important;
+                font-weight: bold !important;
+                background: var(--primary) !important;
+                color: var(--white) !important;
+                border-radius: 8px !important;
+                touch-action: manipulation !important;
+                user-select: none !important;
+                -webkit-tap-highlight-color: transparent !important;
+            }
+            
+            .calendar-nav-btn:active {
+                transform: scale(0.95) !important;
+                background: var(--primary-dark) !important;
+            }
+            
+            .calendar-month-year {
+                font-size: 1.2rem !important;
+                font-weight: 700 !important;
+            }
+            
+            .calendar-day-header {
+                padding: 0.8rem 0.4rem !important;
+                font-size: 0.9rem !important;
+                font-weight: 700 !important;
+            }
+            
+            .calendar-btn {
+                padding: 1rem 1.2rem !important;
+                font-size: 1.1rem !important;
+                font-weight: 600 !important;
+                min-height: 52px !important;
+                border-radius: 8px !important;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .container {
+                padding: 0 0.5rem;
+            }
+            
+            .header {
+                padding: 1rem 0.5rem;
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+            
+            .header h1 {
+                font-size: 1rem;
+                line-height: 1.2;
+                text-align: center;
+            }
+            
+            .header-logo {
+                height: 35px;
+            }
+            
+            .livros-grid {
+                grid-template-columns: 1fr;
+                gap: 0.5rem;
+            }
+            
+            .card-header {
+                padding: 0.75rem;
+            }
+            
+            .form-section {
+                padding: 0.75rem;
+            }
+            
+            .btn-primary {
+                padding: 0.875rem;
+                font-size: 1rem;
+            }
+            
+            .modal-content {
+                width: 98%;
+                margin: 0.5rem;
+            }
+            
+            /* Calendário em telas muito pequenas */
+            .custom-calendar {
+                width: 320px !important;
+                max-width: calc(100vw - 1rem) !important;
+                padding: 1.8rem !important;
+            }
+            
+            .calendar-day {
+                min-height: 52px !important;
+                font-size: 1.2rem !important;
+                font-weight: 700 !important;
+            }
+            
+            .calendar-nav-btn {
+                width: 52px !important;
+                height: 52px !important;
+                font-size: 1.5rem !important;
+            }
+            
+            .calendar-month-year {
+                font-size: 1.3rem !important;
+            }
+            
+            .calendar-day-header {
+                padding: 1rem 0.5rem !important;
+                font-size: 1rem !important;
+            }
+            
+            .calendar-btn {
+                padding: 1.2rem 1.4rem !important;
+                font-size: 1.2rem !important;
+                min-height: 56px !important;
+            }
+            
+            .calendar-header {
+                margin-bottom: 1rem;
+                padding-bottom: 0.75rem;
+            }
+            
+            .calendar-day {
+                min-height: 44px;
+                font-size: 1rem;
+                font-weight: 700;
+            }
+            
+            .calendar-nav-btn {
+                width: 52px;
+                height: 52px;
+                font-size: 1.5rem;
+                background: var(--primary);
+                color: var(--white);
+                border-radius: 10px;
+                touch-action: manipulation;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+            }
+            
+            .calendar-nav-btn:active {
+                transform: scale(0.9);
+                background: var(--primary-dark);
+            }
+            
+            .calendar-month-year {
+                font-size: 1.1rem;
+            }
+            
+            .calendar-day-header {
+                padding: 0.6rem 0.3rem;
+                font-size: 0.8rem;
+            }
+            
+            .calendar-btn {
+                padding: 0.8rem 1.2rem;
+                font-size: 1rem;
+                min-height: 48px;
+            }
+            
+            .format-item,
+            .livros-item {
+                padding: 0.875rem 0.75rem;
+                min-height: 48px;
+            }
+            
+            .company-item {
+                padding: 1rem 0.75rem;
+                min-height: 48px;
+            }
+        }
+        
+        /* Orientação landscape em mobile */
+        @media (max-width: 768px) and (orientation: landscape) {
+            .basic-info-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+            
+            .date-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+            
+            .format-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+            
+            .livros-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+            
+            .header {
+                flex-direction: row;
+                gap: 1rem;
+                padding: 0.75rem 1rem;
+            }
+            
+            .header h1 {
+                font-size: 1.3rem;
+                white-space: nowrap;
+            }
+        }
+        
+        /* Tablets */
+        @media (min-width: 769px) and (max-width: 1024px) {
+            .container {
+                padding: 0 1.5rem;
+            }
+            
+            .livros-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+            
+            .card-header {
+                padding: 1.25rem;
+            }
+            
+            .form-section {
+                padding: 1.25rem;
+            }
         }
     </style>
 </head>
@@ -1823,11 +2432,15 @@ def index():
                                 <div class="date-grid">
                                     <div class="date-item">
                                         <label class="date-sub-label">Data Inicial</label>
-                                        <input type="date" id="dataInicio" name="dataInicio" required>
+                                        <input type="date" id="dataInicio" name="dataInicio" lang="pt-BR" required 
+                                               title="Selecione a data inicial no formato DD/MM/AAAA"
+                                               placeholder="dd/mm/aaaa">
                                     </div>
                                     <div class="date-item">
                                         <label class="date-sub-label">Data Final</label>
-                                        <input type="date" id="dataFim" name="dataFim" required>
+                                        <input type="date" id="dataFim" name="dataFim" lang="pt-BR" required 
+                                               title="Selecione a data final no formato DD/MM/AAAA"
+                                               placeholder="dd/mm/aaaa">
                                     </div>
                                 </div>
                             </div>
@@ -1872,6 +2485,25 @@ def index():
     </div>
 <script>
 document.addEventListener('DOMContentLoaded', function() {
+    // Configurar timezone brasileiro no JavaScript
+    const brazilTimezone = 'America/Sao_Paulo';
+    
+    // Verificar se o navegador suporta configuração de timezone
+    if (Intl && Intl.DateTimeFormat) {
+        try {
+            // Tentar configurar formato brasileiro
+            const dtf = new Intl.DateTimeFormat('pt-BR', {
+                timeZone: brazilTimezone,
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            });
+            console.log('Timezone configurado para:', brazilTimezone);
+        } catch (e) {
+            console.warn('Erro ao configurar timezone:', e);
+        }
+    }
+    
     const form = document.getElementById('livrosForm');
     const submitBtn = document.getElementById('submitBtn');
     const companySearch = document.getElementById('companySearch');
@@ -1894,6 +2526,14 @@ document.addEventListener('DOMContentLoaded', function() {
     const lastBackup = document.getElementById('lastBackup');
     const backupDateTime = document.getElementById('backupDateTime');
     
+    // Configurações de localização brasileira
+    const monthNames = [
+        'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+        'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
+    ];
+    
+    const dayNames = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+    
     let companiesData = [];
     let selectedCompanies = [];
     let statusInterval = null;
@@ -1908,11 +2548,28 @@ document.addEventListener('DOMContentLoaded', function() {
     let activeInput = null;
 
     const initForm = () => {
-        const today = new Date();
-        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().split('T')[0];
-        const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0).toISOString().split('T')[0];
-        dataInicio.value = firstDay;
-        dataFim.value = lastDay;
+        // Configurar data usando timezone brasileiro
+        const now = new Date();
+        const brazilTime = new Date(now.toLocaleString("en-US", {timeZone: "America/Sao_Paulo"}));
+        
+        const firstDay = new Date(brazilTime.getFullYear(), brazilTime.getMonth(), 1);
+        const lastDay = new Date(brazilTime.getFullYear(), brazilTime.getMonth() + 1, 0);
+        
+        // Converter para formato ISO (YYYY-MM-DD) para os inputs
+        const firstDayISO = firstDay.toISOString().split('T')[0];
+        const lastDayISO = lastDay.toISOString().split('T')[0];
+        
+        dataInicio.value = firstDayISO;
+        dataFim.value = lastDayISO;
+        
+        console.log('Datas inicializadas:', {
+            'Primeiro dia': firstDayISO,
+            'Último dia': lastDayISO,
+            'Timezone': 'America/Sao_Paulo'
+        });
+        
+        // Configurar locale brasileiro para os campos de data
+        configureBrazilianDateFormat();
         
         // Mostrar estado inicial bloqueado
         updateDatabaseStatusUI(currentDatabaseStatus);
@@ -1923,6 +2580,155 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // Iniciar monitoramento do banco
         startDatabaseStatusMonitoring();
+    };
+    
+    // Configurar formato de data brasileiro
+    const configureBrazilianDateFormat = () => {
+        // Adicionar atributo lang="pt-BR" aos campos de data
+        const dateInputs = document.querySelectorAll('input[type="date"]');
+        dateInputs.forEach(input => {
+            input.setAttribute('lang', 'pt-BR');
+            
+            // Adicionar event listener para mostrar data formatada no placeholder
+            input.addEventListener('focus', function() {
+                if (!this.value) {
+                    this.setAttribute('placeholder', 'dd/mm/aaaa');
+                }
+            });
+            
+            // Converter valor para formato brasileiro na exibição
+            input.addEventListener('blur', function() {
+                if (this.value) {
+                    const date = new Date(this.value + 'T00:00:00');
+                    if (!isNaN(date.getTime())) {
+                        // Formatar para exibição brasileira no título
+                        const brazilianDate = date.toLocaleDateString('pt-BR');
+                        this.setAttribute('title', `Data selecionada: ${brazilianDate}`);
+                    }
+                }
+            });
+            
+            // Adicionar indicador visual do formato esperado
+            input.addEventListener('focus', function() {
+                const label = this.parentElement.querySelector('.date-sub-label');
+                if (label && !label.textContent.includes('(DD/MM/AAAA)')) {
+                    label.setAttribute('data-original', label.textContent);
+                    label.textContent = label.textContent + ' (DD/MM/AAAA)';
+                    label.style.color = 'var(--primary)';
+                }
+            });
+            
+            input.addEventListener('blur', function() {
+                const label = this.parentElement.querySelector('.date-sub-label');
+                if (label && label.hasAttribute('data-original')) {
+                    label.textContent = label.getAttribute('data-original');
+                    label.style.color = '';
+                    label.removeAttribute('data-original');
+                }
+            });
+        });
+        
+        // Configurar locale do documento
+        document.documentElement.setAttribute('lang', 'pt-BR');
+        
+        // Adicionar CSS para forçar formatação brasileira
+        addBrazilianDateCSS();
+    };
+    
+        /* Adicionar CSS específico para formato brasileiro */
+        const addBrazilianDateCSS = () => {
+            const style = document.createElement('style');
+            style.textContent = `
+                /* Forçar formato DD/MM/AAAA */
+                :lang(pt) input[type="date"]::-webkit-datetime-edit,
+                :lang(pt-BR) input[type="date"]::-webkit-datetime-edit {
+                    direction: ltr;
+                }
+                
+                /* Melhorar visibilidade dos campos de data */
+                input[type="date"]:focus::-webkit-datetime-edit-day-field {
+                    background-color: rgba(59, 130, 246, 0.1);
+                    color: var(--primary);
+                }
+                
+                input[type="date"]:focus::-webkit-datetime-edit-month-field {
+                    background-color: rgba(59, 130, 246, 0.1);
+                    color: var(--primary);
+                }
+                
+                input[type="date"]:focus::-webkit-datetime-edit-year-field {
+                    background-color: rgba(59, 130, 246, 0.1);
+                    color: var(--primary);
+                }
+                
+                /* Personalizar placeholder para navegadores que suportam */
+                input[type="date"]::-webkit-input-placeholder {
+                    color: var(--gray-400);
+                    font-style: italic;
+                }
+                
+                input[type="date"]::-moz-placeholder {
+                    color: var(--gray-400);
+                    font-style: italic;
+                }
+                
+                /* Indicador visual quando campo está vazio */
+                input[type="date"]:invalid {
+                    color: var(--gray-400);
+                }
+                
+                input[type="date"]:valid {
+                    color: var(--gray-700);
+                }
+                
+                /* Melhorar aparência do calendário nativo */
+                input[type="date"]::-webkit-calendar-picker-indicator {
+                    background-image: url('data:image/svg+xml;charset=UTF-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%233b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>');
+                    background-size: 16px 16px;
+                    background-repeat: no-repeat;
+                    background-position: center;
+                    width: 20px;
+                    height: 20px;
+                    cursor: pointer;
+                    opacity: 0.8;
+                    transition: opacity 0.3s ease;
+                }
+                
+                input[type="date"]:hover::-webkit-calendar-picker-indicator {
+                    opacity: 1;
+                }
+            `;
+            document.head.appendChild(style);
+            
+            // Adicionar texto explicativo no primeiro acesso
+            const dateInputs = document.querySelectorAll('input[type="date"]');
+            dateInputs.forEach(input => {
+                // Mostrar formato brasileiro como dica inicial
+                if (!input.value) {
+                    input.setAttribute('data-placeholder', 'DD/MM/AAAA');
+                }
+            });
+        };    // Função para formatar data no padrão brasileiro
+    const formatDateToBrazilian = (dateString) => {
+        if (!dateString) return '';
+        const date = new Date(dateString + 'T00:00:00');
+        if (isNaN(date.getTime())) return dateString;
+        
+        const day = date.getDate().toString().padStart(2, '0');
+        const month = (date.getMonth() + 1).toString().padStart(2, '0');
+        const year = date.getFullYear();
+        
+        return `${day}/${month}/${year}`;
+    };
+    
+    // Função para converter data brasileira para ISO
+    const parseBrazilianDate = (brazilianDate) => {
+        if (!brazilianDate) return '';
+        const parts = brazilianDate.split('/');
+        if (parts.length !== 3) return '';
+        
+        const [day, month, year] = parts;
+        return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
     };
     
     // SISTEMA DE MONITORAMENTO DO BANCO
@@ -2024,9 +2830,15 @@ document.addEventListener('DOMContentLoaded', function() {
     // SISTEMA DE CALENDÁRIO PERSONALIZADO
     const initCustomCalendars = () => {
         const dateItems = document.querySelectorAll('.date-item');
-        dateItems.forEach(item => {
+        dateItems.forEach((item, index) => {
             const input = item.querySelector('input[type="date"]');
             const calendar = createCustomCalendar();
+            
+            // Adicionar IDs únicos
+            const calendarId = `calendar-${index}`;
+            calendar.id = calendarId;
+            input.setAttribute('data-calendar-id', calendarId);
+            
             item.classList.add('custom-date');
             item.style.position = 'relative';
             item.appendChild(calendar);
@@ -2048,6 +2860,13 @@ document.addEventListener('DOMContentLoaded', function() {
                 hideAllCalendars();
             }
         });
+        
+        // Fechar calendário com tecla ESC
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                hideAllCalendars();
+            }
+        });
     };
     
     const createCustomCalendar = () => {
@@ -2060,13 +2879,13 @@ document.addEventListener('DOMContentLoaded', function() {
                 <button type="button" class="calendar-nav-btn" data-action="next">›</button>
             </div>
             <div class="calendar-grid">
-                <div class="calendar-day-header">D</div>
-                <div class="calendar-day-header">S</div>
-                <div class="calendar-day-header">T</div>
-                <div class="calendar-day-header">Q</div>
-                <div class="calendar-day-header">Q</div>
-                <div class="calendar-day-header">S</div>
-                <div class="calendar-day-header">S</div>
+                <div class="calendar-day-header">Dom</div>
+                <div class="calendar-day-header">Seg</div>
+                <div class="calendar-day-header">Ter</div>
+                <div class="calendar-day-header">Qua</div>
+                <div class="calendar-day-header">Qui</div>
+                <div class="calendar-day-header">Sex</div>
+                <div class="calendar-day-header">Sáb</div>
             </div>
             <div class="calendar-actions">
                 <button type="button" class="calendar-btn clear">Limpar</button>
@@ -2075,8 +2894,30 @@ document.addEventListener('DOMContentLoaded', function() {
         `;
         
         // Adicionar event listeners
-        calendar.querySelector('[data-action="prev"]').addEventListener('click', () => navigateMonth(-1, calendar));
-        calendar.querySelector('[data-action="next"]').addEventListener('click', () => navigateMonth(1, calendar));
+        // Adicionar event listeners
+        calendar.querySelector('[data-action="prev"]').addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            navigateMonth(-1, calendar);
+        });
+        calendar.querySelector('[data-action="next"]').addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            navigateMonth(1, calendar);
+        });
+        
+        // Touch events para mobile
+        calendar.querySelector('[data-action="prev"]').addEventListener('touchend', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            navigateMonth(-1, calendar);
+        });
+        calendar.querySelector('[data-action="next"]').addEventListener('touchend', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            navigateMonth(1, calendar);
+        });
+        
         calendar.querySelector('.clear').addEventListener('click', () => clearDate(calendar));
         calendar.querySelector('.today').addEventListener('click', () => selectToday(calendar));
         
@@ -2105,26 +2946,68 @@ document.addEventListener('DOMContentLoaded', function() {
         calendar.style.bottom = '';
         calendar.style.left = '';
         calendar.style.right = '';
+        calendar.style.transform = '';
+        calendar.style.position = '';
         
-        // Posicionamento inteligente
-        const rect = input.getBoundingClientRect();
-        const viewportHeight = window.innerHeight;
-        const viewportWidth = window.innerWidth;
-        const calendarHeight = 280;
-        const calendarWidth = 240;
+        // Detectar se é mobile
+        const isMobile = window.innerWidth <= 768;
         
-        // Posicionamento vertical
-        if (rect.bottom + calendarHeight > viewportHeight && rect.top > calendarHeight) {
-            calendar.style.bottom = 'calc(100% + 0.25rem)';
+        if (isMobile) {
+            // Em mobile, criar um modal simples sem complicações
+            calendar.style.position = 'fixed';
+            calendar.style.top = '10%';
+            calendar.style.left = '50%';
+            calendar.style.transform = 'translateX(-50%)';
+            calendar.style.zIndex = '99999';
+            calendar.style.background = 'white';
+            calendar.style.boxShadow = '0 20px 60px rgba(0,0,0,0.5)';
+            calendar.style.borderRadius = '12px';
+            calendar.style.border = '3px solid #ddd';
+            
+            // Adicionar fundo escuro
+            const modalBg = document.createElement('div');
+            modalBg.id = 'calendar-modal-bg';
+            modalBg.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0,0,0,0.7);
+                z-index: 99998;
+            `;
+            document.body.appendChild(modalBg);
+            
+            // Fechar ao clicar no fundo
+            modalBg.onclick = () => hideAllCalendars();
+            
+            // Mover calendário para o body para evitar problemas de z-index
+            document.body.appendChild(calendar);
+            
         } else {
-            calendar.style.top = 'calc(100% + 0.25rem)';
-        }
-        
-        // Posicionamento horizontal
-        if (rect.left + calendarWidth > viewportWidth) {
-            calendar.style.right = '0';
-        } else {
-            calendar.style.left = '0';
+            // Posicionamento inteligente para desktop
+            const rect = input.getBoundingClientRect();
+            const viewportHeight = window.innerHeight;
+            const viewportWidth = window.innerWidth;
+            const calendarHeight = 280;
+            const calendarWidth = 240;
+            
+            calendar.style.position = 'absolute';
+            calendar.style.zIndex = '2000';
+            
+            // Posicionamento vertical
+            if (rect.bottom + calendarHeight > viewportHeight && rect.top > calendarHeight) {
+                calendar.style.bottom = 'calc(100% + 0.25rem)';
+            } else {
+                calendar.style.top = 'calc(100% + 0.25rem)';
+            }
+            
+            // Posicionamento horizontal
+            if (rect.left + calendarWidth > viewportWidth) {
+                calendar.style.right = '0';
+            } else {
+                calendar.style.left = '0';
+            }
         }
         
         calendar.classList.add('show');
@@ -2133,7 +3016,37 @@ document.addEventListener('DOMContentLoaded', function() {
     const hideAllCalendars = () => {
         document.querySelectorAll('.custom-calendar').forEach(cal => {
             cal.classList.remove('show');
+            
+            // Se está em mobile, mover de volta para o container original
+            if (window.innerWidth <= 768 && cal.parentElement === document.body) {
+                const dateItem = document.querySelector(`input[data-calendar-id="${cal.id}"]`)?.closest('.date-item');
+                if (dateItem) {
+                    dateItem.appendChild(cal);
+                }
+            }
         });
+        
+        // Remover fundo do modal se existir
+        const modalBg = document.getElementById('calendar-modal-bg');
+        if (modalBg) {
+            modalBg.remove();
+        }
+        
+        // Remover backdrop se existir
+        const backdrop = document.querySelector('.calendar-backdrop');
+        if (backdrop) {
+            backdrop.remove();
+        }
+        
+        // Restaurar scroll do body
+        document.body.style.overflow = '';
+        
+        // Esconder overlay se existir
+        const overlay = document.querySelector('.calendar-overlay');
+        if (overlay) {
+            overlay.classList.remove('show');
+        }
+        
         activeInput = null;
     };
     
@@ -2184,6 +3097,7 @@ document.addEventListener('DOMContentLoaded', function() {
     };
     
     const navigateMonth = (direction, calendar) => {
+        console.log('Navegando mês:', direction); // Debug
         currentMonth += direction;
         if (currentMonth < 0) {
             currentMonth = 11;
@@ -2668,15 +3582,43 @@ def iniciar_geracao_livros():
     global db_monitor
     if db_monitor is None or not db_monitor.is_safe_to_process():
         banco_status = db_monitor.get_status() if db_monitor else {'connected': False, 'atualizacao_em_andamento': True}
-        erro_msg = "Processamento bloqueado: "
-        if not banco_status.get('connected'):
-            erro_msg += "Monitor do banco desconectado"
-        elif banco_status.get('atualizacao_em_andamento'):
-            erro_msg += f"Banco em atualização - {banco_status.get('progresso', 'Atualizando...')}"
-        else:
-            erro_msg += "Sistema não está pronto"
         
-        return jsonify({'success': False, 'message': erro_msg}), 400
+        # Informações detalhadas sobre o bloqueio
+        erro_detalhes = []
+        if db_monitor is None:
+            erro_detalhes.append("Monitor do banco não inicializado")
+        else:
+            if not banco_status.get('connected'):
+                time_since = None
+                if db_monitor.last_successful_connection:
+                    time_since = time.time() - db_monitor.last_successful_connection
+                    erro_detalhes.append(f"Monitor desconectado há {time_since:.0f}s")
+                else:
+                    erro_detalhes.append("Monitor nunca conectou")
+                
+                # Verificar se está próximo do timeout de fallback
+                if time_since and time_since > FALLBACK_TIMEOUT * 0.8:
+                    remaining = FALLBACK_TIMEOUT - time_since
+                    if remaining > 0:
+                        erro_detalhes.append(f"Fallback em {remaining:.0f}s")
+                    else:
+                        erro_detalhes.append("Fallback deveria ter liberado - possível erro")
+                        
+            elif banco_status.get('atualizacao_em_andamento'):
+                erro_detalhes.append(f"Banco em atualização: {banco_status.get('progresso', 'Atualizando...')}")
+        
+        erro_msg = "Processamento bloqueado: " + "; ".join(erro_detalhes)
+        
+        return jsonify({
+            'success': False, 
+            'message': erro_msg,
+            'banco_status': banco_status,
+            'actions': [
+                {'label': 'Resetar Monitor', 'endpoint': '/monitor/reset', 'method': 'POST'},
+                {'label': 'Forçar Liberação (EMERGÊNCIA)', 'endpoint': '/monitor/force_allow', 'method': 'POST'},
+                {'label': 'Status Detalhado', 'endpoint': '/monitor/status_detailed', 'method': 'GET'}
+            ]
+        }), 400
     
     data = request.get_json()
     required_fields = ['empresas_selecionadas', 'data_inicio', 'data_fim', 'livros_selecionados']
@@ -2738,6 +3680,105 @@ def get_companies_route():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/monitor/reset', methods=['POST'])
+def reset_monitor():
+    """Endpoint para resetar o monitor do banco manualmente"""
+    try:
+        global db_monitor
+        if db_monitor is None:
+            return jsonify({
+                'success': False,
+                'message': 'Monitor não inicializado'
+            }), 400
+        
+        db_monitor.force_reset_connection()
+        return jsonify({
+            'success': True,
+            'message': 'Monitor resetado com sucesso'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/monitor/force_allow', methods=['POST'])
+def force_allow_processing():
+    """Endpoint para forçar liberação do processamento (emergência)"""
+    try:
+        global db_monitor
+        if db_monitor is None:
+            return jsonify({
+                'success': False,
+                'message': 'Monitor não inicializado'
+            }), 400
+        
+        db_monitor.force_allow_processing = True
+        db_monitor._update_status({
+            'atualizacao_em_andamento': False,
+            'progresso': 'Processamento FORÇADAMENTE LIBERADO pelo usuário',
+            'erro': None
+        })
+        
+        return jsonify({
+            'success': True,
+            'message': 'Processamento forçadamente liberado - USE COM CUIDADO!'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/monitor/status_detailed')
+def get_detailed_monitor_status():
+    """Endpoint para status detalhado do monitor"""
+    try:
+        global db_monitor
+        if db_monitor is None:
+            return jsonify({
+                'success': False,
+                'message': 'Monitor não inicializado'
+            })
+        
+        status = db_monitor.get_status()
+        now = time.time()
+        
+        # Informações adicionais
+        extra_info = {
+            'time_since_last_connection': None,
+            'fallback_timeout_remaining': None,
+            'websockets_available': WEBSOCKETS_AVAILABLE,
+            'monitor_thread_alive': db_monitor.monitor_thread and db_monitor.monitor_thread.is_alive(),
+            'force_allow_active': db_monitor.force_allow_processing
+        }
+        
+        if db_monitor.last_successful_connection:
+            time_since = now - db_monitor.last_successful_connection
+            extra_info['time_since_last_connection'] = f"{time_since:.1f}s"
+            
+            if time_since < FALLBACK_TIMEOUT:
+                extra_info['fallback_timeout_remaining'] = f"{FALLBACK_TIMEOUT - time_since:.1f}s"
+            else:
+                extra_info['fallback_timeout_remaining'] = "TIMEOUT ATINGIDO - Processamento liberado"
+        
+        return jsonify({
+            'success': True,
+            'status': status,
+            'extra_info': extra_info,
+            'config': {
+                'websocket_uri': WEBSOCKET_URI,
+                'fallback_timeout': FALLBACK_TIMEOUT,
+                'health_check_interval': HEALTH_CHECK_INTERVAL,
+                'max_reconnect_attempts': MAX_RECONNECT_ATTEMPTS
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/static/logo.jpg')
 def serve_logo():
     logo_path = 'logo.jpg'
@@ -2759,19 +3800,55 @@ if __name__ == '__main__':
     # Para testar localmente SEM usar R:\, descomente a linha abaixo:
     # os.environ['SIMULATE_ENV'] = 'true'
     
+    # Verificar se está rodando em Docker
+    is_docker = os.environ.get('DOCKER', 'false').lower() == 'true'
+    
+    # Limpar diretório de saída (apenas arquivos, não o diretório em si)
     if os.path.exists('output_robo'):
-        shutil.rmtree('output_robo')
+        try:
+            if is_docker:
+                # Em Docker, apenas limpar os arquivos do diretório
+                for filename in os.listdir('output_robo'):
+                    file_path = os.path.join('output_robo', filename)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                    elif os.path.isdir(file_path) and not filename.startswith('.'):
+                        shutil.rmtree(file_path)
+            else:
+                # Localmente, pode remover o diretório inteiro
+                shutil.rmtree('output_robo')
+        except (OSError, PermissionError) as e:
+            print(f"AVISO: Não foi possível limpar output_robo: {e}")
+    
+    # Criar diretório de saída se não existir
+    os.makedirs('output_robo', exist_ok=True)
     
     print("🚀 Iniciando Sistema de Automação - Livros Fiscais")
+    if is_docker:
+        print("🐳 Executando em container Docker")
     print(f"🔗 WebSocket configurado para: {WEBSOCKET_URI}")
+    print(f"⏰ Timeout de fallback: {FALLBACK_TIMEOUT}s ({FALLBACK_TIMEOUT/60:.1f} min)")
+    print(f"🔄 Health check: {HEALTH_CHECK_INTERVAL}s")
     print("📊 Monitor do banco será iniciado após o Flask")
+    
+    if WEBSOCKETS_AVAILABLE:
+        print("✅ Módulo websockets disponível - Monitor ativo")
+    else:
+        print("⚠️ Módulo websockets não encontrado - Monitor desabilitado")
+        print("   Para instalar: pip install websockets")
+    
     print("="*60)
     
     # Inicializar monitor do banco de forma não-bloqueante
     init_database_monitor()
     
     try:
-        app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+        # Configurações para produção em Docker
+        host = os.environ.get('FLASK_HOST', '0.0.0.0')
+        port = int(os.environ.get('FLASK_PORT', 5000))
+        debug = not is_docker and os.environ.get('FLASK_ENV') != 'production'
+        
+        app.run(host=host, port=port, debug=debug, use_reloader=False)
     except KeyboardInterrupt:
         print("\n🔄 Encerrando sistema...")
         if db_monitor:

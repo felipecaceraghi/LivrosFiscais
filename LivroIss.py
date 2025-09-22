@@ -486,3 +486,6 @@ def gerar_livro_iss(codi_emp, data_inicio, data_fim, exportar_pdf=True, exportar
         if conn:
             conn.close()
             print("\nConexão com o banco de dados fechada.")
+
+
+
